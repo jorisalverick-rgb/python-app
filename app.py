@@ -9,9 +9,6 @@ Objectif: "ça marche une bonne fois pour toute".
 - Compat .env: GROQ_* ou LLM_* (comme ton autre app R)
 - Extraction JSON robuste + réparation JSON (2 passes) quel que soit le provider
 - Tout le texte joueur en français
-
-IMPORTANT (Streamlit Cloud):
-- Les clés doivent être lues via st.secrets (puis fallback os.environ/.env)
 """
 
 from __future__ import annotations
@@ -30,55 +27,8 @@ try:
     from dotenv import load_dotenv  # type: ignore
     load_dotenv()
 except Exception:
+    # Sur Streamlit Cloud, on utilise st.secrets => variables d'env déjà injectées
     pass
-
-
-# =========================
-# Streamlit Secrets support
-# =========================
-try:
-    import streamlit as st  # type: ignore
-    _ST_SECRETS = st.secrets  # Mapping-like
-except Exception:
-    _ST_SECRETS = {}  # type: ignore
-
-
-def _get_secret(name: str, default: str = "") -> str:
-    """
-    Lit une variable dans cet ordre:
-    1) Streamlit Cloud: st.secrets[name]
-    2) Env vars: os.getenv(name)
-    3) default
-    """
-    try:
-        v = _ST_SECRETS.get(name, None)  # type: ignore[attr-defined]
-        if v is not None:
-            # st.secrets peut renvoyer str/int/bool
-            if isinstance(v, str):
-                if v.strip():
-                    return v.strip()
-            else:
-                s = str(v).strip()
-                if s:
-                    return s
-    except Exception:
-        pass
-
-    v2 = os.getenv(name, "")
-    if isinstance(v2, str) and v2.strip():
-        return v2.strip()
-
-    return default
-
-
-def _get_int_secret(name: str, default: int) -> int:
-    s = _get_secret(name, "")
-    if not s:
-        return default
-    try:
-        return int(float(s))
-    except Exception:
-        return default
 
 
 # =========================
@@ -87,32 +37,32 @@ def _get_int_secret(name: str, default: int) -> int:
 
 # --- Gemini ---
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
-GEMINI_API_VERSION = _get_secret("GEMINI_API_VERSION", "v1beta").strip()
+GEMINI_API_VERSION = os.getenv("GEMINI_API_VERSION", "v1beta").strip()
 GEMINI_BASE = f"https://generativelanguage.googleapis.com/{GEMINI_API_VERSION}"
 GEMINI_MODELS_URL = f"{GEMINI_BASE}/models"
-DEFAULT_MODEL = _get_secret("GEMINI_MODEL", "").strip()
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "").strip()
 
 # --- Groq (OpenAI-compatible) ---
 # On accepte:
 #   - GROQ_API_KEY / GROQ_BASE_URL / GROQ_MODEL
 #   - OU LLM_API_KEY / LLM_BASE_URL / LLM_MODEL (ton format existant)
-GROQ_API_KEY_ENV = _get_secret("GROQ_API_KEY_ENV", "GROQ_API_KEY").strip()
+GROQ_API_KEY_ENV = os.getenv("GROQ_API_KEY_ENV", "GROQ_API_KEY").strip()
 
 GROQ_BASE_URL = (
-    _get_secret("GROQ_BASE_URL", "")
-    or _get_secret("LLM_BASE_URL", "")
+    os.getenv("GROQ_BASE_URL")
+    or os.getenv("LLM_BASE_URL")
     or "https://api.groq.com/openai/v1"
 ).strip().rstrip("/")
 
 GROQ_MODEL = (
-    _get_secret("GROQ_MODEL", "")
-    or _get_secret("LLM_MODEL", "")
+    os.getenv("GROQ_MODEL")
+    or os.getenv("LLM_MODEL")
     or "llama-3.1-8b-instant"
 ).strip()
 
 # Networking
-HTTP_TIMEOUT = _get_int_secret("GEMINI_HTTP_TIMEOUT", 90)
-MAX_HTTP_ATTEMPTS = _get_int_secret("GEMINI_HTTP_RETRIES", 2)
+HTTP_TIMEOUT = int(os.getenv("GEMINI_HTTP_TIMEOUT", "90"))
+MAX_HTTP_ATTEMPTS = int(os.getenv("GEMINI_HTTP_RETRIES", "2"))
 
 # Provider choices
 PROVIDERS = ("auto", "gemini", "groq")
@@ -378,13 +328,19 @@ def _normalize_provider(value: Optional[str]) -> str:
     return v if v in PROVIDERS else "auto"
 
 def _should_fallback_to_groq(err: Exception) -> bool:
+    """
+    On bascule vers Groq quand Gemini est:
+    - quota / rate limit (429, RESOURCE_EXHAUSTED)
+    - surchargé (503, UNAVAILABLE, overloaded)
+    - ou problème réseau / déconnexion
+    """
     msg = (str(err) or "").lower()
+
     keywords = [
         "429", "resource_exhausted", "quota", "rate limit",
         "503", "unavailable", "overloaded",
         "remote end closed", "remote disconnected", "connection aborted",
         "timed out", "timeout", "connection reset",
-        "no_gemini_key",
     ]
     return any(k in msg for k in keywords)
 
@@ -396,10 +352,10 @@ def _should_fallback_to_groq(err: Exception) -> bool:
 _cached_model: Optional[str] = None
 
 def _get_gemini_key() -> str:
-    key = _get_secret(GEMINI_API_KEY_ENV, "").strip()
+    key = os.getenv(GEMINI_API_KEY_ENV, "").strip()
     if not key:
         raise AIRequestError(
-            "Clé API Gemini manquante.\n"
+            f"Clé API Gemini manquante.\n"
             f"- En local: ajoute {GEMINI_API_KEY_ENV}=... dans ton fichier .env\n"
             f"- Sur Streamlit Cloud: ajoute {GEMINI_API_KEY_ENV} dans App settings → Secrets"
         )
@@ -472,7 +428,6 @@ def _gemini_generate_raw_text(
     max_output_tokens: int = 1400,
     timeout: int = HTTP_TIMEOUT,
 ) -> str:
-    # si pas de clé => on déclenche un fallback en auto
     key = _get_gemini_key()
     resolved_model = _resolve_model(model)
     url = f"{GEMINI_BASE}/{resolved_model}:generateContent?key={key}"
@@ -482,6 +437,7 @@ def _gemini_generate_raw_text(
         "generationConfig": {
             "temperature": float(temperature),
             "maxOutputTokens": int(max_output_tokens),
+            # On garde, mais si Google refuse, l'erreur sera attrapée et fallback Groq possible
             "responseMimeType": "application/json",
         },
     }
@@ -510,11 +466,11 @@ def _gemini_generate_raw_text(
 
 def _get_groq_key() -> str:
     # 1) clé via GROQ_API_KEY_ENV (par défaut "GROQ_API_KEY")
-    key = _get_secret(GROQ_API_KEY_ENV, "").strip()
+    key = os.getenv(GROQ_API_KEY_ENV, "").strip()
     if key:
         return key
     # 2) fallback vers ton format LLM_API_KEY
-    key2 = _get_secret("LLM_API_KEY", "").strip()
+    key2 = os.getenv("LLM_API_KEY", "").strip()
     if key2:
         return key2
     raise AIRequestError(
@@ -530,6 +486,9 @@ def _groq_generate_raw_text(
     max_output_tokens: int = 1400,
     timeout: int = HTTP_TIMEOUT,
 ) -> str:
+    """
+    Groq = endpoint OpenAI-compatible: POST /chat/completions
+    """
     key = _get_groq_key()
     url = f"{GROQ_BASE_URL}/chat/completions"
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
@@ -594,6 +553,11 @@ def _repair_to_json(
     schema_text: str,
     use_groq: bool = False,
 ) -> Dict[str, Any]:
+    """
+    Repair via the same provider we used:
+    - if use_groq=True => repair with Groq (avoid hitting Gemini quota again)
+    - else => repair with Gemini
+    """
     gen = _groq_generate_raw_text if use_groq else _gemini_generate_raw_text
 
     p1 = _repair_prompt(schema_name, schema_text, raw_text, strict_level=1)
@@ -616,6 +580,9 @@ def _generate_raw_text_with_provider_choice(
     max_tokens: int,
     preferred_provider: str = "auto",
 ) -> Tuple[str, str]:
+    """
+    Returns (raw_text, provider_used) where provider_used is "gemini" or "groq".
+    """
     preferred_provider = _normalize_provider(preferred_provider)
 
     def call_gemini() -> Tuple[str, str]:
@@ -636,7 +603,7 @@ def _generate_raw_text_with_provider_choice(
     if preferred_provider == "groq":
         return call_groq()
 
-    # auto => Gemini puis fallback Groq
+    # auto
     try:
         return call_gemini()
     except Exception as e:
@@ -679,6 +646,11 @@ def generate_scene(
     next_hint: Dict[str, Any],
     preferred_provider: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """
+    preferred_provider:
+      - None => utilise game_state["ai_provider"] si présent, sinon "auto"
+      - "auto" | "gemini" | "groq"
+    """
     if preferred_provider is None:
         preferred_provider = game_state.get("ai_provider", "auto")
 
@@ -735,6 +707,11 @@ def judge_answer(
     player_answer: str,
     preferred_provider: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """
+    preferred_provider:
+      - None => utilise game_state["ai_provider"] si présent, sinon "auto"
+      - "auto" | "gemini" | "groq"
+    """
     if preferred_provider is None:
         preferred_provider = game_state.get("ai_provider", "auto")
 
