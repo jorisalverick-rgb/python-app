@@ -24,6 +24,12 @@ from game import PlayerState, recommended_next, apply_judgement, is_game_over, x
 from storage import load_state_dict, save_state_dict, reset_save
 from ai import generate_scene, judge_answer, quick_heuristic_checks, AIError
 
+import os
+import streamlit as st
+
+st.sidebar.write("DEBUG: GEMINI_API_KEY existe ?", bool(os.getenv("GEMINI_API_KEY")))
+st.sidebar.write("DEBUG: LLM_API_KEY existe ?", bool(os.getenv("LLM_API_KEY")))
+
 
 # -----------------------------
 # App config
@@ -628,3 +634,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
