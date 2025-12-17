@@ -30,6 +30,8 @@ import streamlit as st
 st.sidebar.write("DEBUG: GEMINI_API_KEY existe ?", bool(os.getenv("GEMINI_API_KEY")))
 st.sidebar.write("DEBUG: LLM_API_KEY existe ?", bool(os.getenv("LLM_API_KEY")))
 
+st.sidebar.write("DEBUG GEMINI_API_KEY:", bool(os.getenv("GEMINI_API_KEY")))
+st.sidebar.write("DEBUG LLM_API_KEY:", bool(os.getenv("LLM_API_KEY")))
 
 # -----------------------------
 # App config
@@ -634,4 +636,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
