@@ -1,798 +1,630 @@
-# ai.py
+# app.py
 """
-Python Quest — IA layer (Gemini principal + Groq secours) + JSON validation
+Python Quest — Streamlit app (UI + game loop)
 
-Objectif: "ça marche une bonne fois pour toute".
-- Gemini par défaut (meilleur)
-- Fallback Groq automatique si Gemini est saturé / quota / indisponible
-- Sélection manuelle possible: auto | gemini | groq
-- Compat .env: GROQ_* ou LLM_* (comme ton autre app R)
-- Extraction JSON robuste + réparation JSON (2 passes) quel que soit le provider
-- Tout le texte joueur en français
+Run:
+  streamlit run app.py
+
+Files required:
+- game.py
+- ai.py
+- storage.py
+- .env (contains GEMINI_API_KEY and/or Groq keys)
 """
 
 from __future__ import annotations
 
-import json
 import os
-import re
-import time
-from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple, Optional
+import traceback
+from typing import Any, Dict, Optional, Tuple, List
 
-import requests
+import streamlit as st
 
-# dotenv est utile en local, mais ne doit JAMAIS casser en cloud
-try:
-    from dotenv import load_dotenv  # type: ignore
-    load_dotenv()
-except Exception:
-    # Sur Streamlit Cloud, on utilise st.secrets => variables d'env déjà injectées
-    pass
+from game import PlayerState, recommended_next, apply_judgement, is_game_over, xp_progress_within_level
+from storage import load_state_dict, save_state_dict, reset_save
+from ai import generate_scene, judge_answer, quick_heuristic_checks, AIError
 
 
-# =========================
-# Configuration
-# =========================
+# -----------------------------
+# App config
+# -----------------------------
 
-# --- Gemini ---
-GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
-GEMINI_API_VERSION = os.getenv("GEMINI_API_VERSION", "v1beta").strip()
-GEMINI_BASE = f"https://generativelanguage.googleapis.com/{GEMINI_API_VERSION}"
-GEMINI_MODELS_URL = f"{GEMINI_BASE}/models"
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "").strip()
+APP_TITLE = "Python Quest"
+SAVE_PATH = "save.json"
 
-# --- Groq (OpenAI-compatible) ---
-# On accepte:
-#   - GROQ_API_KEY / GROQ_BASE_URL / GROQ_MODEL
-#   - OU LLM_API_KEY / LLM_BASE_URL / LLM_MODEL (ton format existant)
-GROQ_API_KEY_ENV = os.getenv("GROQ_API_KEY_ENV", "GROQ_API_KEY").strip()
-
-GROQ_BASE_URL = (
-    os.getenv("GROQ_BASE_URL")
-    or os.getenv("LLM_BASE_URL")
-    or "https://api.groq.com/openai/v1"
-).strip().rstrip("/")
-
-GROQ_MODEL = (
-    os.getenv("GROQ_MODEL")
-    or os.getenv("LLM_MODEL")
-    or "llama-3.1-8b-instant"
-).strip()
-
-# Networking
-HTTP_TIMEOUT = int(os.getenv("GEMINI_HTTP_TIMEOUT", "90"))
-MAX_HTTP_ATTEMPTS = int(os.getenv("GEMINI_HTTP_RETRIES", "2"))
-
-# Provider choices
-PROVIDERS = ("auto", "gemini", "groq")
-
-# JSON parsing helpers
-_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
-_FENCE_START_RE = re.compile(r"^```[a-zA-Z]*\s*")
-_FENCE_END_RE = re.compile(r"\s*```$")
+st.set_page_config(
+    page_title=APP_TITLE,
+    page_icon="🧩",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 
-# =========================
-# Errors
-# =========================
+# -----------------------------
+# Styling (kid-friendly)
+# -----------------------------
 
-class AIError(Exception):
-    pass
+def inject_css() -> None:
+    st.markdown(
+        """
+<style>
+/* Global */
+:root { --pq-radius: 22px; --pq-pad: 16px; }
 
-class AIResponseFormatError(AIError):
-    pass
+.block-container { padding-top: 1.2rem; padding-bottom: 1.5rem; }
+h1, h2, h3 { letter-spacing: 0.2px; }
 
-class AIRequestError(AIError):
-    pass
+/* Cards */
+.pq-card{
+  border-radius: var(--pq-radius);
+  padding: var(--pq-pad);
+  border: 1px solid rgba(255,255,255,0.10);
+  background: rgba(255,255,255,0.05);
+  box-shadow: 0 10px 22px rgba(0,0,0,0.18);
+}
+.pq-title{
+  font-size: 1.15rem;
+  font-weight: 700;
+  margin-bottom: 0.35rem;
+}
+.pq-sub{
+  opacity: 0.85;
+  margin-bottom: 0.65rem;
+}
+.pq-pill{
+  display: inline-block;
+  padding: 0.15rem 0.6rem;
+  border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.18);
+  background: rgba(255,255,255,0.06);
+  font-size: 0.82rem;
+  margin-right: 0.35rem;
+  margin-bottom: 0.35rem;
+}
 
+/* Mission prompt box */
+.pq-prompt{
+  border-radius: var(--pq-radius);
+  padding: 16px;
+  border: 1px dashed rgba(255,255,255,0.22);
+  background: rgba(0,0,0,0.15);
+}
 
-# =========================
-# JSON utilities
-# =========================
+/* Buttons */
+.stButton > button{
+  border-radius: 14px;
+  padding: 0.65rem 0.9rem;
+  font-weight: 650;
+}
+.stTextArea textarea{
+  border-radius: 14px;
+}
 
-def _strip_code_fences(text: str) -> str:
-    t = (text or "").strip()
-    if t.startswith("```"):
-        t = _FENCE_START_RE.sub("", t)
-        t = _FENCE_END_RE.sub("", t).strip()
-    return t.strip()
+/* Code blocks */
+code, pre { border-radius: 14px !important; }
 
-def _extract_json_object(text: str) -> Dict[str, Any]:
-    """
-    Robust JSON extraction:
-    - direct dict JSON
-    - JSON list -> first dict
-    - fenced ```json ... ```
-    - first {...} block inside any surrounding text
-    """
-    raw = _strip_code_fences((text or "").strip())
-
-    # 1) Direct parse
-    try:
-        obj = json.loads(raw)
-        if isinstance(obj, dict):
-            return obj
-        if isinstance(obj, list) and obj and isinstance(obj[0], dict):
-            return obj[0]
-    except Exception:
-        pass
-
-    # 2) Find first {...} block
-    m = _JSON_OBJECT_RE.search(raw)
-    if not m:
-        raise AIResponseFormatError("No JSON object found in model output.")
-    block = m.group(0)
-
-    try:
-        obj = json.loads(block)
-        if isinstance(obj, dict):
-            return obj
-        if isinstance(obj, list) and obj and isinstance(obj[0], dict):
-            return obj[0]
-    except Exception as e:
-        raise AIResponseFormatError(f"Failed to parse extracted JSON: {e}") from e
-
-    raise AIResponseFormatError("Extracted JSON is not a dict.")
-
-def _require_keys(obj: Dict[str, Any], keys: List[str], ctx: str = "") -> None:
-    missing = [k for k in keys if k not in obj]
-    if missing:
-        raise AIResponseFormatError(f"Missing keys {missing} in JSON response. Context={ctx}")
-
-def _clamp_int(x: Any, lo: int, hi: int, default: int) -> int:
-    try:
-        v = int(x)
-    except Exception:
-        return default
-    return max(lo, min(hi, v))
-
-
-# =========================
-# Player profile (compact)
-# =========================
-
-@dataclass
-class PlayerProfile:
-    player_name: str
-    level: int
-    difficulty: int
-    zone: str
-    recent_summary: str
-    weak_topics: List[str]
-    preferred_challenge_types: List[str]
-
-def build_profile_payload(game_state: Dict[str, Any]) -> PlayerProfile:
-    name = str(game_state.get("player_name", "Joris"))
-    level = int(game_state.get("level", 1))
-    difficulty = int(game_state.get("difficulty", 4))
-    zone = str(game_state.get("zone", "Village des Bases"))
-
-    hist = game_state.get("history", []) or []
-    recent = hist[-6:]
-    if recent:
-        parts = [
-            f"{s.get('topic','mixed')}|{s.get('challenge_type','mixed')}:{s.get('verdict','?')}"
-            for s in recent
-        ]
-        recent_summary = " ; ".join(parts)
-    else:
-        recent_summary = "Aucune tentative pour l’instant."
-
-    stats = game_state.get("stats", {}) or {}
-    topic_attempts = stats.get("topic_attempts", {}) or {}
-    topic_wrongs = stats.get("topic_wrongs", {}) or {}
-
-    weak = []
-    for t, a in topic_attempts.items():
-        a = int(a or 0)
-        w = int(topic_wrongs.get(t, 0) or 0)
-        if a >= 3:
-            rate = (w + 1) / (a + 3)
-            if rate >= 0.45:
-                weak.append((rate, t))
-    weak.sort(reverse=True)
-    weak_topics = [t for _, t in weak[:3]] or []
-
-    return PlayerProfile(
-        player_name=name,
-        level=level,
-        difficulty=difficulty,
-        zone=zone,
-        recent_summary=recent_summary,
-        weak_topics=weak_topics,
-        preferred_challenge_types=["code_builder", "debug_arena"],
+/* Small footer */
+.pq-footer{
+  opacity: 0.65;
+  font-size: 0.85rem;
+}
+</style>
+        """,
+        unsafe_allow_html=True,
     )
 
 
-# =========================
-# Prompts (FR)
-# =========================
+# -----------------------------
+# Session state helpers
+# -----------------------------
 
-def system_rules_text() -> str:
-    return (
-        "Tu es le Game Master + Judge + Coach du jeu 'Python Quest'.\n"
-        "Langue OBLIGATOIRE: français (FR). Le joueur répond en français.\n"
-        "Ne réponds pas en anglais (sauf mots-clés Python dans du code).\n"
-        "Ton: ludique, enfant-friendly, motivant, mais sérieux intellectuellement.\n"
-        "Ne jamais utiliser les mots: devoir, examen, interro, TD, TP.\n"
-        "Priorité: défis où le joueur ÉCRIT du code, puis débogage et mini quiz.\n"
-        "Sortie OBLIGATOIRE: un SEUL objet JSON valide.\n"
-        "Aucun markdown. Aucun texte hors JSON.\n"
-        "La sortie doit commencer par '{' et finir par '}'.\n"
-    )
+def ss_init_defaults() -> None:
+    if "state" not in st.session_state:
+        st.session_state.state = None  # PlayerState
+    if "scene" not in st.session_state:
+        st.session_state.scene = None  # dict from AI
+    if "answer" not in st.session_state:
+        st.session_state.answer = ""
+    if "last_judge" not in st.session_state:
+        st.session_state.last_judge = None  # dict
+    if "last_engine_update" not in st.session_state:
+        st.session_state.last_engine_update = None  # dict
+    if "busy" not in st.session_state:
+        st.session_state.busy = False
 
-def build_scene_prompt(profile: PlayerProfile, next_hint: Dict[str, Any]) -> str:
-    topic = str(next_hint.get("topic", "mixed"))
-    ctype = str(next_hint.get("challenge_type", "code_builder"))
-    difficulty = int(next_hint.get("difficulty", profile.difficulty))
-    weak = ", ".join(profile.weak_topics) if profile.weak_topics else "aucun"
-
-    schema = (
-        "{\n"
-        '  "scene_id": "string",\n'
-        '  "zone": "string",\n'
-        '  "topic": "basics|data_structures|control_flow|functions|oop|pandas|matplotlib|mixed",\n'
-        '  "challenge_type": "code_builder|debug_arena|qcm|true_false|boss_fight",\n'
-        '  "difficulty": 1,\n'
-        '  "narration": "string (FR)",\n'
-        '  "mission_title": "string (FR, court)",\n'
-        '  "mission_goal": "string (FR, 1-2 lignes)",\n'
-        '  "input_mode": "code|text|choice|true_false",\n'
-        '  "prompt": "string (FR, consigne claire)",\n'
-        '  "starter_code": "string (optionnel, Python)",\n'
-        '  "choices": ["A ...","B ...","C ...","D ..."] (optionnel),\n'
-        '  "constraints": ["..."] (FR),\n'
-        '  "tests": [{"input":"string","expected_contains":"string"}],\n'
-        '  "rubric": {"primary_skills":["..."],"common_mistakes":["..."],"grading_focus":"string (FR)"}\n'
-        "}\n"
-    )
-
-    return (
-        f"{system_rules_text()}\n"
-        "TÂCHE: Génère la prochaine scène jouable + un défi.\n"
-        "Retourne UNIQUEMENT le JSON du schéma.\n\n"
-        "PROFIL JOUEUR:\n"
-        f"- nom: {profile.player_name}\n"
-        f"- niveau: {profile.level}\n"
-        f"- difficulté_globale: {profile.difficulty}\n"
-        f"- zone: {profile.zone}\n"
-        f"- tentatives_récentes: {profile.recent_summary}\n"
-        f"- points_faibles: {weak}\n\n"
-        "INDICATION SUIVANTE:\n"
-        f"- topic: {topic}\n"
-        f"- challenge_type: {ctype}\n"
-        f"- difficulty: {difficulty}\n\n"
-        f"SCHÉMA:\n{schema}\n"
-        "RÈGLE ABSOLUE: commence par '{' et finis par '}'. Un seul objet JSON.\n"
-    )
-
-def build_judge_prompt(profile: PlayerProfile, scene: Dict[str, Any], player_answer: str) -> str:
-    compact_scene = {
-        "scene_id": scene.get("scene_id"),
-        "topic": scene.get("topic"),
-        "challenge_type": scene.get("challenge_type"),
-        "difficulty": scene.get("difficulty"),
-        "input_mode": scene.get("input_mode"),
-        "mission_title": scene.get("mission_title"),
-        "mission_goal": scene.get("mission_goal"),
-        "prompt": scene.get("prompt"),
-        "starter_code": scene.get("starter_code", ""),
-        "choices": scene.get("choices", []),
-        "constraints": scene.get("constraints", []),
-        "tests": scene.get("tests", []),
-        "rubric": scene.get("rubric", {}),
-    }
-    weak = ", ".join(profile.weak_topics) if profile.weak_topics else "aucun"
-
-    schema = (
-        "{\n"
-        '  "scene_id": "string",\n'
-        '  "verdict": "correct|close|wrong",\n'
-        '  "xp_suggestion": 0,\n'
-        '  "short_feedback": "string (FR, 1-2 lignes)",\n'
-        '  "detailed_feedback": "string (FR, explication détaillée)",\n'
-        '  "corrected_solution": "string (Python / réponse)",\n'
-        '  "why_it_works": "string (FR)",\n'
-        '  "mini_lesson": {"title":"string (FR)","content":"string (FR, très détaillé si faux)","examples":["..."]},\n'
-        '  "common_pitfalls": ["..."] (FR),\n'
-        '  "next_tip": "string (FR)",\n'
-        '  "followup": {"suggested_next_challenge":"code_builder|debug_arena|qcm|true_false|boss_fight",'
-        '              "suggested_topic":"basics|data_structures|control_flow|functions|oop|pandas|matplotlib|mixed",'
-        '              "difficulty_adjustment_hint":"up|down|same"}\n'
-        "}\n"
-    )
-
-    return (
-        f"{system_rules_text()}\n"
-        "TÂCHE: Corrige et évalue la réponse du joueur.\n"
-        "Retourne UNIQUEMENT le JSON du schéma.\n\n"
-        "PROFIL JOUEUR:\n"
-        f"- nom: {profile.player_name}\n"
-        f"- niveau: {profile.level}\n"
-        f"- difficulté_globale: {profile.difficulty}\n"
-        f"- points_faibles: {weak}\n\n"
-        f"SCÈNE:\n{json.dumps(compact_scene, ensure_ascii=False)}\n\n"
-        f"RÉPONSE DU JOUEUR:\n{player_answer}\n\n"
-        f"SCHÉMA:\n{schema}\n"
-        "RÈGLE ABSOLUE: commence par '{' et finis par '}'. Un seul objet JSON.\n"
-    )
+    # NEW: IA provider selection
+    if "ai_provider" not in st.session_state:
+        st.session_state.ai_provider = "auto"  # auto | gemini | groq
 
 
-# =========================
-# Provider selection helpers
-# =========================
-
-def _normalize_provider(value: Optional[str]) -> str:
-    v = (value or "auto").lower().strip()
-    return v if v in PROVIDERS else "auto"
-
-def _should_fallback_to_groq(err: Exception) -> bool:
-    """
-    On bascule vers Groq quand Gemini est:
-    - quota / rate limit (429, RESOURCE_EXHAUSTED)
-    - surchargé (503, UNAVAILABLE, overloaded)
-    - ou problème réseau / déconnexion
-    """
-    msg = (str(err) or "").lower()
-
-    keywords = [
-        "429", "resource_exhausted", "quota", "rate limit",
-        "503", "unavailable", "overloaded",
-        "remote end closed", "remote disconnected", "connection aborted",
-        "timed out", "timeout", "connection reset",
-    ]
-    return any(k in msg for k in keywords)
-
-
-# =========================
-# Gemini client (auto-pick + retry)
-# =========================
-
-_cached_model: Optional[str] = None
-
-def _get_gemini_key() -> str:
-    key = os.getenv(GEMINI_API_KEY_ENV, "").strip()
-    if not key:
-        raise AIRequestError(
-            f"Clé API Gemini manquante.\n"
-            f"- En local: ajoute {GEMINI_API_KEY_ENV}=... dans ton fichier .env\n"
-            f"- Sur Streamlit Cloud: ajoute {GEMINI_API_KEY_ENV} dans App settings → Secrets"
-        )
-    return key
-
-def _list_models(timeout: int = 20) -> Dict[str, Any]:
-    key = _get_gemini_key()
-    url = f"{GEMINI_MODELS_URL}?key={key}"
-    r = requests.get(url, timeout=timeout)
-    if r.status_code >= 400:
-        raise AIRequestError(f"Gemini ListModels error {r.status_code}: {r.text[:1200]}")
-    return r.json()
-
-def _pick_model_from_list(models_json: Dict[str, Any]) -> str:
-    models = models_json.get("models", []) or []
-    candidates: List[str] = []
-    for m in models:
-        name = m.get("name", "")
-        methods = m.get("supportedGenerationMethods", []) or []
-        if name and "generateContent" in methods:
-            candidates.append(name)
-
-    if not candidates:
-        raise AIRequestError("Aucun modèle Gemini disponible ne supporte generateContent pour cette clé.")
-
-    def score(n: str) -> int:
-        n = n.lower()
-        if "flash" in n:
-            return 0
-        if "pro" in n:
-            return 1
-        return 2
-
-    candidates.sort(key=score)
-    return candidates[0]
-
-def _resolve_model(model: str) -> str:
-    global _cached_model
-    override = (model or "").strip()
-    if override:
-        if override.startswith("models/"):
-            return override
-        return "models/" + override
-
-    if _cached_model:
-        return _cached_model
-
-    picked = _pick_model_from_list(_list_models())
-    _cached_model = picked
-    return picked
-
-def _extract_text_from_gemini_response(data: Dict[str, Any]) -> str:
-    try:
-        cand0 = (data.get("candidates") or [])[0]
-        content = cand0.get("content") or {}
-        parts = content.get("parts") or []
-        texts = []
-        for p in parts:
-            t = p.get("text")
-            if isinstance(t, str) and t.strip():
-                texts.append(t)
-        return "\n".join(texts).strip()
-    except Exception:
-        return ""
-
-def _gemini_generate_raw_text(
-    prompt: str,
-    model: str = DEFAULT_MODEL,
-    temperature: float = 0.6,
-    max_output_tokens: int = 1400,
-    timeout: int = HTTP_TIMEOUT,
-) -> str:
-    key = _get_gemini_key()
-    resolved_model = _resolve_model(model)
-    url = f"{GEMINI_BASE}/{resolved_model}:generateContent?key={key}"
-
-    payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": float(temperature),
-            "maxOutputTokens": int(max_output_tokens),
-            # On garde, mais si Google refuse, l'erreur sera attrapée et fallback Groq possible
-            "responseMimeType": "application/json",
-        },
-    }
-
-    last_err: Optional[Exception] = None
-    for attempt in range(1, MAX_HTTP_ATTEMPTS + 1):
+def load_or_create_player() -> PlayerState:
+    saved = load_state_dict(SAVE_PATH)
+    if saved:
         try:
-            r = requests.post(url, json=payload, timeout=timeout)
-            if r.status_code >= 400:
-                raise AIRequestError(f"Gemini API error {r.status_code}: {r.text[:2000]}")
-            data = r.json()
-            text = _extract_text_from_gemini_response(data)
-            if not text:
-                raise AIRequestError(f"Gemini returned empty text. Raw={str(data)[:1200]}")
-            return text
-        except requests.exceptions.RequestException as e:
-            last_err = e
-            time.sleep(0.8 * attempt)
-
-    raise AIRequestError(f"Connexion instable vers Gemini (après retry): {last_err}")
+            state = PlayerState.from_dict(saved)
+            return state
+        except Exception:
+            # corrupted save or incompatible
+            pass
+    return PlayerState(player_name="Joris")
 
 
-# =========================
-# Groq client (OpenAI-compatible)
-# =========================
-
-def _get_groq_key() -> str:
-    # 1) clé via GROQ_API_KEY_ENV (par défaut "GROQ_API_KEY")
-    key = os.getenv(GROQ_API_KEY_ENV, "").strip()
-    if key:
-        return key
-    # 2) fallback vers ton format LLM_API_KEY
-    key2 = os.getenv("LLM_API_KEY", "").strip()
-    if key2:
-        return key2
-    raise AIRequestError(
-        "Clé API Groq manquante.\n"
-        f"- En local: ajoute {GROQ_API_KEY_ENV}=... (ou LLM_API_KEY=...) dans ton fichier .env\n"
-        f"- Sur Streamlit Cloud: ajoute {GROQ_API_KEY_ENV} ou LLM_API_KEY dans App settings → Secrets"
-    )
-
-def _groq_generate_raw_text(
-    prompt: str,
-    model: str = GROQ_MODEL,
-    temperature: float = 0.4,
-    max_output_tokens: int = 1400,
-    timeout: int = HTTP_TIMEOUT,
-) -> str:
-    """
-    Groq = endpoint OpenAI-compatible: POST /chat/completions
-    """
-    key = _get_groq_key()
-    url = f"{GROQ_BASE_URL}/chat/completions"
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": float(temperature),
-        "max_tokens": int(max_output_tokens),
-    }
-
-    last_err: Optional[Exception] = None
-    for attempt in range(1, MAX_HTTP_ATTEMPTS + 1):
-        try:
-            r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-            if r.status_code >= 400:
-                raise AIRequestError(f"Groq API error {r.status_code}: {r.text[:2000]}")
-            data = r.json()
-            try:
-                text = data["choices"][0]["message"]["content"]
-            except Exception as e:
-                raise AIRequestError(f"Format Groq inattendu: {e}. Raw={str(data)[:1200]}")
-            if not isinstance(text, str) or not text.strip():
-                raise AIRequestError("Groq returned empty text.")
-            return text.strip()
-        except requests.exceptions.RequestException as e:
-            last_err = e
-            time.sleep(0.8 * attempt)
-
-    raise AIRequestError(f"Connexion instable vers Groq (après retry): {last_err}")
-
-
-# =========================
-# Auto-repair JSON (2 passes)
-# =========================
-
-def _repair_prompt(schema_name: str, schema_text: str, raw_text: str, strict_level: int) -> str:
-    if strict_level == 2:
-        extra = (
-            "IMPORTANT:\n"
-            "- Tu dois produire EXACTEMENT 1 objet JSON.\n"
-            "- Aucun texte avant/après.\n"
-            "- Aucune liste JSON.\n"
-            "- Commence par '{' et finis par '}'.\n"
-            "- Toutes les chaînes doivent être en FR.\n"
-        )
-    else:
-        extra = "Rappel: un SEUL objet JSON, commence par '{' et finis par '}'.\n"
-
-    return (
-        f"{system_rules_text()}\n"
-        f"TÂCHE: Transforme le contenu ci-dessous en UN SEUL objet JSON valide.\n"
-        f"Nom du schéma: {schema_name}\n"
-        f"{extra}\n"
-        f"SCHÉMA CIBLE:\n{schema_text}\n\n"
-        f"CONTENU À CONVERTIR:\n{raw_text}\n"
-    )
-
-def _repair_to_json(
-    raw_text: str,
-    schema_name: str,
-    schema_text: str,
-    use_groq: bool = False,
-) -> Dict[str, Any]:
-    """
-    Repair via the same provider we used:
-    - if use_groq=True => repair with Groq (avoid hitting Gemini quota again)
-    - else => repair with Gemini
-    """
-    gen = _groq_generate_raw_text if use_groq else _gemini_generate_raw_text
-
-    p1 = _repair_prompt(schema_name, schema_text, raw_text, strict_level=1)
-    t1 = gen(prompt=p1, temperature=0.2, max_output_tokens=1600)
+def persist_player(state: PlayerState) -> None:
     try:
-        return _extract_json_object(t1)
-    except AIResponseFormatError:
-        p2 = _repair_prompt(schema_name, schema_text, raw_text, strict_level=2)
-        t2 = gen(prompt=p2, temperature=0.0, max_output_tokens=1600)
-        return _extract_json_object(t2)
-
-
-# =========================
-# Core generator: manual selection + fallback
-# =========================
-
-def _generate_raw_text_with_provider_choice(
-    prompt: str,
-    temperature: float,
-    max_tokens: int,
-    preferred_provider: str = "auto",
-) -> Tuple[str, str]:
-    """
-    Returns (raw_text, provider_used) where provider_used is "gemini" or "groq".
-    """
-    preferred_provider = _normalize_provider(preferred_provider)
-
-    def call_gemini() -> Tuple[str, str]:
-        return (
-            _gemini_generate_raw_text(prompt=prompt, temperature=temperature, max_output_tokens=max_tokens),
-            "gemini",
-        )
-
-    def call_groq() -> Tuple[str, str]:
-        return (
-            _groq_generate_raw_text(prompt=prompt, temperature=temperature, max_output_tokens=max_tokens),
-            "groq",
-        )
-
-    if preferred_provider == "gemini":
-        return call_gemini()
-
-    if preferred_provider == "groq":
-        return call_groq()
-
-    # auto
-    try:
-        return call_gemini()
+        save_state_dict(state.to_dict(), SAVE_PATH)
     except Exception as e:
-        if _should_fallback_to_groq(e):
-            return call_groq()
-        raise
+        st.warning(f"⚠️ Sauvegarde impossible: {e}")
 
 
-def _generate_json_with_repair(
-    prompt: str,
-    required_keys: List[str],
-    ctx: str,
-    schema_text: str,
-    temperature: float,
-    max_tokens: int,
-    preferred_provider: str = "auto",
-) -> Dict[str, Any]:
-    raw, provider = _generate_raw_text_with_provider_choice(
-        prompt=prompt,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        preferred_provider=preferred_provider,
-    )
+# -----------------------------
+# UI widgets
+# -----------------------------
 
-    try:
-        obj = _extract_json_object(raw)
-    except AIResponseFormatError:
-        obj = _repair_to_json(raw, schema_name=ctx, schema_text=schema_text, use_groq=(provider == "groq"))
-
-    _require_keys(obj, required_keys, ctx=ctx)
-    return obj
+def hearts_row(hearts: int, max_hearts: int) -> str:
+    full = "❤️" * max(0, min(hearts, max_hearts))
+    empty = "🖤" * max(0, max_hearts - max(0, min(hearts, max_hearts)))
+    return full + empty
 
 
-# =========================
-# Public API
-# =========================
+def render_header(state: PlayerState) -> None:
+    lvl, xp_into, pct = xp_progress_within_level(state.xp)
+    st.title("🧩 Python Quest")
+    st.caption("Apprendre Python en jouant — aventure + code + boss fights ✨")
 
-def generate_scene(
-    game_state: Dict[str, Any],
-    next_hint: Dict[str, Any],
-    preferred_provider: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    preferred_provider:
-      - None => utilise game_state["ai_provider"] si présent, sinon "auto"
-      - "auto" | "gemini" | "groq"
-    """
-    if preferred_provider is None:
-        preferred_provider = game_state.get("ai_provider", "auto")
+    col1, col2, col3, col4 = st.columns([1.2, 1.0, 1.2, 1.2], vertical_alignment="center")
+    with col1:
+        st.markdown(
+            f"""
+<div class="pq-card">
+  <div class="pq-title">👤 {state.player_name}</div>
+  <div class="pq-sub">Zone : <b>{state.zone}</b></div>
+  <div class="pq-pill">Niveau {state.level}</div>
+  <div class="pq-pill">Difficulté {state.difficulty}/10</div>
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with col2:
+        st.markdown(
+            f"""
+<div class="pq-card">
+  <div class="pq-title">❤️ Vies</div>
+  <div style="font-size:1.25rem">{hearts_row(state.hearts, state.max_hearts)}</div>
+  <div class="pq-sub">Combo : <b>{state.streak}</b> (Best: {state.best_streak})</div>
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with col3:
+        st.markdown(
+            f"""
+<div class="pq-card">
+  <div class="pq-title">⚡ XP</div>
+  <div class="pq-sub">{state.xp} XP total</div>
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.progress(pct, text=f"Progression niveau {lvl} → {lvl+1} : {int(pct*100)}% ({xp_into} XP dans le niveau)")
+    with col4:
+        inv = state.inventory[-6:] if state.inventory else []
+        badges = state.badges[-4:] if state.badges else []
+        st.markdown('<div class="pq-card">', unsafe_allow_html=True)
+        st.markdown('<div class="pq-title">🎒 Inventaire & Badges</div>', unsafe_allow_html=True)
+        if inv:
+            st.markdown(" ".join([f"<span class='pq-pill'>{x}</span>" for x in inv]), unsafe_allow_html=True)
+        else:
+            st.caption("Inventaire vide… pour l’instant 😄")
+        if badges:
+            st.markdown(" ".join([f"<span class='pq-pill'>🏅 {b}</span>" for b in badges]), unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    profile = build_profile_payload(game_state)
-    prompt = build_scene_prompt(profile, next_hint)
 
-    schema_text = (
-        "{\n"
-        '  "scene_id": "string",\n'
-        '  "zone": "string",\n'
-        '  "topic": "basics|data_structures|control_flow|functions|oop|pandas|matplotlib|mixed",\n'
-        '  "challenge_type": "code_builder|debug_arena|qcm|true_false|boss_fight",\n'
-        '  "difficulty": 1,\n'
-        '  "narration": "string",\n'
-        '  "mission_title": "string",\n'
-        '  "mission_goal": "string",\n'
-        '  "input_mode": "code|text|choice|true_false",\n'
-        '  "prompt": "string",\n'
-        '  "starter_code": "string (optional)",\n'
-        '  "choices": ["A","B","C","D"] (optional),\n'
-        '  "constraints": ["..."],\n'
-        '  "tests": [{"input":"string","expected_contains":"string"}],\n'
-        '  "rubric": {"primary_skills":["..."],"common_mistakes":["..."],"grading_focus":"string"}\n'
-        "}\n"
-    )
+def _provider_label(p: str) -> str:
+    return {"auto": "Auto (Gemini → Groq)", "gemini": "Gemini (forcé)", "groq": "Groq (forcé)"}.get(p, "Auto")
 
-    required = [
-        "scene_id", "zone", "topic", "challenge_type", "difficulty", "narration",
-        "mission_title", "mission_goal", "input_mode", "prompt", "constraints", "rubric"
+
+def render_sidebar(state: PlayerState) -> None:
+    with st.sidebar:
+        st.header("⚙️ Commandes")
+        st.write("Ajuste seulement si tu veux. Sinon, laisse le jeu gérer.")
+
+        # -------- NEW: IA provider control --------
+        st.subheader("🤖 Moteur IA")
+        st.session_state.ai_provider = st.radio(
+            "Choix IA",
+            options=["auto", "gemini", "groq"],
+            format_func=_provider_label,
+            index=["auto", "gemini", "groq"].index(st.session_state.ai_provider),
+            horizontal=False,
+        )
+
+        cprov1, cprov2 = st.columns(2)
+        with cprov1:
+            if st.button("🔁 Toggle"):
+                # Toggle rapide gemini <-> groq (auto reste au choix via radio)
+                if st.session_state.ai_provider == "gemini":
+                    st.session_state.ai_provider = "groq"
+                elif st.session_state.ai_provider == "groq":
+                    st.session_state.ai_provider = "gemini"
+                else:
+                    # si auto, on passe à gemini pour commencer
+                    st.session_state.ai_provider = "gemini"
+                st.rerun()
+
+        with cprov2:
+            st.caption(f"Actuel: **{_provider_label(st.session_state.ai_provider)}**")
+
+        st.divider()
+
+        # Manual difficulty override (optional)
+        new_diff = st.slider("Difficulté globale", 1, 10, int(state.difficulty))
+        if new_diff != state.difficulty:
+            state.difficulty = int(new_diff)
+            persist_player(state)
+            st.success("Difficulté mise à jour ✅")
+
+        st.divider()
+        st.subheader("🧼 Sauvegarde")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("💾 Forcer sauvegarde"):
+                persist_player(state)
+                st.success("Sauvegardé.")
+        with c2:
+            if st.button("🗑️ Reset jeu"):
+                reset_save(SAVE_PATH)
+                st.session_state.state = PlayerState(player_name=state.player_name)
+                st.session_state.scene = None
+                st.session_state.answer = ""
+                st.session_state.last_judge = None
+                st.session_state.last_engine_update = None
+                st.success("Jeu réinitialisé ✅")
+                st.rerun()
+
+        st.divider()
+        st.subheader("🧠 À propos")
+        st.caption("Python Quest génère des missions via IA (Gemini/Groq), puis corrige avec un feedback détaillé.")
+        if not os.getenv("GEMINI_API_KEY", "").strip():
+            st.warning("Clé GEMINI_API_KEY manquante dans .env / environnement.")
+        # Groq est optionnel en mode auto, mais utile
+        if not (os.getenv("GROQ_API_KEY", "").strip() or os.getenv("LLM_API_KEY", "").strip()):
+            st.info("Astuce: ajoute une clé Groq (GROQ_API_KEY ou LLM_API_KEY) pour éviter les blocages quota Gemini.")
+
+
+def render_scene(scene: Dict[str, Any], state: PlayerState) -> None:
+    # Mission card
+    tags = [
+        f"📌 {scene.get('topic','mixed')}",
+        f"🎮 {scene.get('challenge_type','code_builder')}",
+        f"🔥 diff {scene.get('difficulty', state.difficulty)}/10",
     ]
+    tags_html = " ".join([f"<span class='pq-pill'>{t}</span>" for t in tags])
 
-    obj = _generate_json_with_repair(
-        prompt=prompt,
-        required_keys=required,
-        ctx="SCENE",
-        schema_text=schema_text,
-        temperature=0.6,
-        max_tokens=1500,
-        preferred_provider=str(preferred_provider),
+    st.markdown(
+        f"""
+<div class="pq-card">
+  <div class="pq-title">🗺️ {scene.get('mission_title','Mission')}</div>
+  <div class="pq-sub">{scene.get('narration','')}</div>
+  {tags_html}
+  <div class="pq-prompt" style="margin-top:12px">
+    <b>🎯 Objectif</b><br/>
+    {scene.get('mission_goal','')}
+    <hr style="opacity:0.2"/>
+    <b>🧩 Ta mission</b><br/>
+    {scene.get('prompt','')}
+  </div>
+</div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    obj["difficulty"] = _clamp_int(
-        obj.get("difficulty"), 1, 10,
-        default=int(next_hint.get("difficulty", profile.difficulty))
-    )
-    obj.setdefault("starter_code", "")
-    obj.setdefault("choices", [])
-    obj.setdefault("tests", [])
-    return obj
+    # Starter code
+    starter = scene.get("starter_code", "") or ""
+    if starter.strip():
+        st.markdown("#### 🧱 Starter code")
+        st.code(starter, language="python")
 
-def judge_answer(
-    game_state: Dict[str, Any],
-    scene: Dict[str, Any],
-    player_answer: str,
-    preferred_provider: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    preferred_provider:
-      - None => utilise game_state["ai_provider"] si présent, sinon "auto"
-      - "auto" | "gemini" | "groq"
-    """
-    if preferred_provider is None:
-        preferred_provider = game_state.get("ai_provider", "auto")
-
-    profile = build_profile_payload(game_state)
-    prompt = build_judge_prompt(profile, scene, player_answer)
-
-    schema_text = (
-        "{\n"
-        '  "scene_id": "string",\n'
-        '  "verdict": "correct|close|wrong",\n'
-        '  "xp_suggestion": 0,\n'
-        '  "short_feedback": "string",\n'
-        '  "detailed_feedback": "string",\n'
-        '  "corrected_solution": "string",\n'
-        '  "why_it_works": "string",\n'
-        '  "mini_lesson": {"title":"string","content":"string","examples":["..."]},\n'
-        '  "common_pitfalls": ["..."],\n'
-        '  "next_tip": "string",\n'
-        '  "followup": {"suggested_next_challenge":"code_builder|debug_arena|qcm|true_false|boss_fight",'
-        '              "suggested_topic":"basics|data_structures|control_flow|functions|oop|pandas|matplotlib|mixed",'
-        '              "difficulty_adjustment_hint":"up|down|same"}\n'
-        "}\n"
-    )
-
-    required = [
-        "scene_id", "verdict", "xp_suggestion", "short_feedback", "detailed_feedback",
-        "corrected_solution", "why_it_works", "mini_lesson", "common_pitfalls", "next_tip", "followup"
-    ]
-
-    obj = _generate_json_with_repair(
-        prompt=prompt,
-        required_keys=required,
-        ctx="JUDGE",
-        schema_text=schema_text,
-        temperature=0.25,
-        max_tokens=1800,
-        preferred_provider=str(preferred_provider),
-    )
-
-    verdict = str(obj.get("verdict", "wrong")).lower().strip()
-    if verdict not in ("correct", "close", "wrong"):
-        verdict = "wrong"
-    obj["verdict"] = verdict
-    obj["xp_suggestion"] = _clamp_int(obj.get("xp_suggestion"), 0, 50, default=0)
-
-    ml = obj.get("mini_lesson", {})
-    if not isinstance(ml, dict):
-        ml = {"title": "Mini-cours", "content": "", "examples": []}
-    ml.setdefault("title", "Mini-cours")
-    ml.setdefault("content", "")
-    ml.setdefault("examples", [])
-    if not isinstance(ml.get("examples"), list):
-        ml["examples"] = [str(ml.get("examples"))]
-    obj["mini_lesson"] = ml
-
-    fu = obj.get("followup", {})
-    if not isinstance(fu, dict):
-        fu = {
-            "suggested_next_challenge": "code_builder",
-            "suggested_topic": "mixed",
-            "difficulty_adjustment_hint": "same",
-        }
-    fu.setdefault("suggested_next_challenge", "code_builder")
-    fu.setdefault("suggested_topic", "mixed")
-    fu.setdefault("difficulty_adjustment_hint", "same")
-    obj["followup"] = fu
-
-    return obj
+    # Constraints
+    constraints = scene.get("constraints", []) or []
+    if constraints:
+        st.markdown("#### ✅ Contraintes")
+        st.write(" • " + "\n • ".join([str(c) for c in constraints]))
 
 
-def quick_heuristic_checks(scene: Dict[str, Any], player_answer: str) -> Tuple[bool, List[str]]:
-    msgs: List[str] = []
-    ans = (player_answer or "").strip()
-    if not ans:
-        return False, ["Tu n'as rien envoyé 😅 Écris au moins un début et je t'aide."]
-
+def render_answer_input(scene: Dict[str, Any]) -> str:
     mode = str(scene.get("input_mode", "code"))
-    if mode == "code":
-        p = str(scene.get("prompt", "")).lower()
-        if "classe" in p and "class " not in ans:
-            msgs.append("Indice: tu vas sûrement créer une classe (`class ...:`).")
-        if "fonction" in p and "def " not in ans:
-            msgs.append("Indice: tu vas sûrement définir une fonction (`def ...():`).")
-    return True, msgs
+
+    if mode in ("choice", "true_false"):
+        # Present choices as radio
+        if mode == "true_false":
+            choice = st.radio("Ta réponse :", ["Vrai", "Faux"], horizontal=True)
+            return "true" if choice == "Vrai" else "false"
+
+        choices = scene.get("choices", []) or []
+        if not choices:
+            st.info("Aucun choix fourni (mission mal formée). Clique 'Nouvelle mission'.")
+            return ""
+        picked = st.radio("Choisis une option :", choices)
+        return picked
+
+    # code/text input
+    label = "✍️ Écris ton code ici" if mode == "code" else "✍️ Ta réponse"
+    height = 260 if mode == "code" else 120
+    return st.text_area(label, value=st.session_state.answer, height=height, placeholder="Écris ici…")
+
+
+def render_feedback(judge: Dict[str, Any], engine_update: Dict[str, Any], state: PlayerState) -> None:
+    verdict = judge.get("verdict", "wrong")
+    short = judge.get("short_feedback", "")
+    xp_sug = judge.get("xp_suggestion", 0)
+
+    # Verdict banner
+    if verdict == "correct":
+        st.success(f"✅ {short}")
+        st.balloons()
+    elif verdict == "close":
+        st.warning(f"🟡 {short}")
+    else:
+        st.error(f"❌ {short}")
+
+    # Engine outcome
+    xp_delta = engine_update.get("xp_delta", 0)
+    hearts_delta = engine_update.get("hearts_delta", 0)
+    level_up = engine_update.get("level_up", False)
+    gained_heart = engine_update.get("gained_heart", False)
+    new_badges = engine_update.get("new_badges", []) or []
+
+    st.markdown(
+        f"""
+<div class="pq-card">
+  <div class="pq-title">📈 Résultat</div>
+  <span class="pq-pill">XP +{xp_delta}</span>
+  <span class="pq-pill">Vies {hearts_delta:+d}</span>
+  <span class="pq-pill">Suggestion IA: {int(xp_sug)} XP</span>
+  <span class="pq-pill">Difficulté actuelle: {state.difficulty}/10</span>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if level_up:
+        st.success(f"🎉 Niveau UP ! Tu es maintenant niveau {state.level} !")
+    if gained_heart:
+        st.info("❤️ Bonus : tu récupères une vie !")
+    if new_badges:
+        st.info("🏅 Nouveaux badges : " + ", ".join(new_badges))
+
+    # Detailed feedback sections
+    with st.expander("🧠 Explication détaillée (lisible)", expanded=True):
+        st.write(judge.get("detailed_feedback", ""))
+
+    with st.expander("✅ Solution corrigée (référence)", expanded=False):
+        sol = judge.get("corrected_solution", "")
+        if sol.strip():
+            st.code(sol, language="python")
+        else:
+            st.write(sol)
+
+    with st.expander("🔍 Pourquoi ça marche (logique)", expanded=False):
+        st.write(judge.get("why_it_works", ""))
+
+    ml = judge.get("mini_lesson", {}) or {}
+    with st.expander("📚 Mini-cours (si tu veux tout comprendre)", expanded=(verdict != "correct")):
+        st.subheader(ml.get("title", "Mini-cours"))
+        st.write(ml.get("content", ""))
+        examples = ml.get("examples", []) or []
+        if examples:
+            st.markdown("**Exemples :**")
+            for ex in examples[:4]:
+                st.code(str(ex), language="python")
+
+    pitfalls = judge.get("common_pitfalls", []) or []
+    if pitfalls:
+        with st.expander("⚠️ Pièges fréquents", expanded=False):
+            st.write(" • " + "\n • ".join([str(p) for p in pitfalls]))
+
+    st.caption("👉 Prochain tip : " + str(judge.get("next_tip", "")))
+
+
+# -----------------------------
+# Main flow
+# -----------------------------
+
+def ensure_scene(state: PlayerState) -> None:
+    """
+    If no scene exists, generate one.
+    """
+    if st.session_state.scene is not None:
+        return
+
+    next_hint = recommended_next(state)
+    provider = st.session_state.ai_provider
+
+    try:
+        st.session_state.scene = generate_scene(state.to_dict(), next_hint, preferred_provider=provider)
+        st.session_state.last_judge = None
+        st.session_state.last_engine_update = None
+        st.session_state.answer = ""
+        persist_player(state)
+    except AIError as e:
+        st.session_state.scene = None
+        st.error(f"🤖 Erreur IA ({_provider_label(provider)}) : {e}")
+    except Exception as e:
+        st.session_state.scene = None
+        st.error(f"Erreur inattendue : {e}")
+        st.code(traceback.format_exc())
+
+
+def request_new_scene(state: PlayerState) -> None:
+    st.session_state.scene = None
+    ensure_scene(state)
+
+
+def submit_answer(state: PlayerState) -> None:
+    scene = st.session_state.scene
+    if not scene:
+        st.warning("Aucune mission active. Clique 'Nouvelle mission'.")
+        return
+
+    answer = st.session_state.answer or ""
+    ok, msgs = quick_heuristic_checks(scene, answer)
+    if not ok:
+        for m in msgs:
+            st.warning(m)
+        return
+    for m in msgs:
+        st.info(m)
+
+    # time measurement
+    seconds_spent = state.stop_attempt_timer()
+    provider = st.session_state.ai_provider
+
+    try:
+        judge = judge_answer(state.to_dict(), scene, answer, preferred_provider=provider)
+    except AIError as e:
+        st.error(f"🤖 Erreur IA ({_provider_label(provider)}) : {e}")
+        return
+    except Exception as e:
+        st.error(f"Erreur inattendue : {e}")
+        st.code(traceback.format_exc())
+        return
+
+    # Update engine
+    engine_update = apply_judgement(
+        state=state,
+        verdict=str(judge.get("verdict", "wrong")),
+        challenge_type=str(scene.get("challenge_type", "code_builder")),
+        topic=str(scene.get("topic", "mixed")),
+        difficulty_used=int(scene.get("difficulty", state.difficulty)),
+        seconds_spent=seconds_spent,
+    )
+
+    # Persist
+    persist_player(state)
+
+    # Store results
+    st.session_state.last_judge = judge
+    st.session_state.last_engine_update = engine_update
+
+    # Game over?
+    if is_game_over(state):
+        st.session_state.scene = None
+
+
+# -----------------------------
+# App
+# -----------------------------
+
+def main() -> None:
+    inject_css()
+    ss_init_defaults()
+
+    # Load/create player into session
+    if st.session_state.state is None:
+        st.session_state.state = load_or_create_player()
+
+    state: PlayerState = st.session_state.state
+    render_sidebar(state)
+    render_header(state)
+
+    # Game Over screen
+    if is_game_over(state):
+        st.markdown(
+            """
+<div class="pq-card">
+  <div class="pq-title">💀 Oh non… plus de vies !</div>
+  <div class="pq-sub">Pas grave : tu vas revenir plus fort 💪</div>
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("🔁 Rejouer (3 vies)"):
+                state.hearts = state.max_hearts
+                persist_player(state)
+                st.session_state.scene = None
+                st.session_state.last_judge = None
+                st.session_state.last_engine_update = None
+                st.rerun()
+        with c2:
+            if st.button("🗑️ Reset total"):
+                reset_save(SAVE_PATH)
+                st.session_state.state = PlayerState(player_name=state.player_name)
+                st.session_state.scene = None
+                st.session_state.last_judge = None
+                st.session_state.last_engine_update = None
+                st.rerun()
+        st.stop()
+
+    # Controls
+    st.divider()
+    top_c1, top_c2, top_c3 = st.columns([1, 1, 2], vertical_alignment="center")
+
+    with top_c1:
+        if st.button("🆕 Nouvelle mission"):
+            request_new_scene(state)
+            st.rerun()
+
+    with top_c2:
+        if st.button("🚀 Booster (plus dur)"):
+            state.difficulty = min(10, state.difficulty + 1)
+            persist_player(state)
+            st.success("Difficulté augmentée ✅")
+            request_new_scene(state)
+            st.rerun()
+
+    with top_c3:
+        st.caption("Astuce: si c'est trop facile, clique Booster. Si c'est dur, la difficulté s'ajuste toute seule.")
+
+    # Ensure current scene exists
+    ensure_scene(state)
+    scene = st.session_state.scene
+
+    if not scene:
+        st.info("Clique 'Nouvelle mission' pour démarrer.")
+        st.stop()
+
+    # Start timer when a scene is displayed and no previous judge exists
+    if st.session_state.last_judge is None and state._active_started_at is None:
+        state.start_attempt_timer()
+
+    # Render mission
+    st.divider()
+    render_scene(scene, state)
+
+    # Answer input
+    st.divider()
+    st.markdown("### 🎮 À toi de jouer")
+    answer = render_answer_input(scene)
+    st.session_state.answer = answer
+
+    # Submit button
+    submit_col1, submit_col2 = st.columns([1, 2])
+    with submit_col1:
+        if st.button("✅ Valider ma réponse"):
+            submit_answer(state)
+            st.rerun()
+
+    with submit_col2:
+        st.caption("Tu peux répondre même si ce n'est pas parfait — le jeu te corrige et t'apprend.")
+
+    # Feedback
+    if st.session_state.last_judge and st.session_state.last_engine_update:
+        st.divider()
+        st.markdown("## 🧾 Correction & Coaching")
+        render_feedback(st.session_state.last_judge, st.session_state.last_engine_update, state)
+
+        # Next mission CTA
+        st.divider()
+        if st.button("➡️ Mission suivante"):
+            request_new_scene(state)
+            st.rerun()
+
+    st.divider()
+    st.markdown('<div class="pq-footer">Python Quest • version V1 • by you + IA + Python 🔥</div>', unsafe_allow_html=True)
+
+
+if __name__ == "__main__":
+    main()
