@@ -21,9 +21,14 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple, Optional
 
 import requests
-from dotenv import load_dotenv
 
-load_dotenv()  # Streamlit does not auto-load .env
+# dotenv est utile en local, mais ne doit JAMAIS casser en cloud
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    # Sur Streamlit Cloud, on utilise st.secrets => variables d'env déjà injectées
+    pass
 
 
 # =========================
@@ -349,7 +354,11 @@ _cached_model: Optional[str] = None
 def _get_gemini_key() -> str:
     key = os.getenv(GEMINI_API_KEY_ENV, "").strip()
     if not key:
-        raise AIRequestError(f"Clé API Gemini manquante. Mets {GEMINI_API_KEY_ENV} dans ton fichier .env.")
+        raise AIRequestError(
+            f"Clé API Gemini manquante.\n"
+            f"- En local: ajoute {GEMINI_API_KEY_ENV}=... dans ton fichier .env\n"
+            f"- Sur Streamlit Cloud: ajoute {GEMINI_API_KEY_ENV} dans App settings → Secrets"
+        )
     return key
 
 def _list_models(timeout: int = 20) -> Dict[str, Any]:
@@ -428,6 +437,7 @@ def _gemini_generate_raw_text(
         "generationConfig": {
             "temperature": float(temperature),
             "maxOutputTokens": int(max_output_tokens),
+            # On garde, mais si Google refuse, l'erreur sera attrapée et fallback Groq possible
             "responseMimeType": "application/json",
         },
     }
@@ -464,7 +474,9 @@ def _get_groq_key() -> str:
     if key2:
         return key2
     raise AIRequestError(
-        f"Clé API Groq manquante. Mets {GROQ_API_KEY_ENV}=... (ou LLM_API_KEY=...) dans ton fichier .env."
+        "Clé API Groq manquante.\n"
+        f"- En local: ajoute {GROQ_API_KEY_ENV}=... (ou LLM_API_KEY=...) dans ton fichier .env\n"
+        f"- Sur Streamlit Cloud: ajoute {GROQ_API_KEY_ENV} ou LLM_API_KEY dans App settings → Secrets"
     )
 
 def _groq_generate_raw_text(
@@ -476,7 +488,6 @@ def _groq_generate_raw_text(
 ) -> str:
     """
     Groq = endpoint OpenAI-compatible: POST /chat/completions
-    On garde la consigne JSON dans le prompt + notre repair derrière.
     """
     key = _get_groq_key()
     url = f"{GROQ_BASE_URL}/chat/completions"
@@ -571,11 +582,6 @@ def _generate_raw_text_with_provider_choice(
 ) -> Tuple[str, str]:
     """
     Returns (raw_text, provider_used) where provider_used is "gemini" or "groq".
-
-    preferred_provider:
-      - "gemini": Gemini only (no fallback)
-      - "groq":   Groq only (no fallback)
-      - "auto":   Gemini then fallback Groq if Gemini fails with known transient/quota errors
     """
     preferred_provider = _normalize_provider(preferred_provider)
 
@@ -601,7 +607,6 @@ def _generate_raw_text_with_provider_choice(
     try:
         return call_gemini()
     except Exception as e:
-        # Si Gemini échoue (quota, overload, réseau), on tente Groq
         if _should_fallback_to_groq(e):
             return call_groq()
         raise
@@ -764,7 +769,11 @@ def judge_answer(
 
     fu = obj.get("followup", {})
     if not isinstance(fu, dict):
-        fu = {"suggested_next_challenge": "code_builder", "suggested_topic": "mixed", "difficulty_adjustment_hint": "same"}
+        fu = {
+            "suggested_next_challenge": "code_builder",
+            "suggested_topic": "mixed",
+            "difficulty_adjustment_hint": "same",
+        }
     fu.setdefault("suggested_next_challenge", "code_builder")
     fu.setdefault("suggested_topic", "mixed")
     fu.setdefault("difficulty_adjustment_hint", "same")
@@ -787,3 +796,4 @@ def quick_heuristic_checks(scene: Dict[str, Any], player_answer: str) -> Tuple[b
         if "fonction" in p and "def " not in ans:
             msgs.append("Indice: tu vas sûrement définir une fonction (`def ...():`).")
     return True, msgs
+
